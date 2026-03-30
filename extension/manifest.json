@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "AOWeb Security Audit",
+  "version": "1.0",
+  "description": "Security audit tool for aoweb.app - authorized testing only",
+  "permissions": [],
+  "content_scripts": [
+    {
+      "matches": ["https://aoweb.app/*"],
+      "js": ["inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    }
+  ]
+}
