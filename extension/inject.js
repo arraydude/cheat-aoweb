@@ -92,10 +92,63 @@
     player: { map: 0, x: 0, y: 0, heading: 0, hp: 0, maxHp: 0, mana: 0, maxMana: 0, gold: 0, exp: 0, level: 0 },
     mapName: "",
     serverCooldowns: {}, // track actual server acceptance times per action type
+    blockedTiles: {},    // { mapId: Set<"x,y"> }
+    mapGraph: {},        // computed from MAP_GRID: { mapId: {n,s,e,w} }
     filterOps: null,     // null = show all, Set of opcodes to show
     hidePing: true,      // hide ping/pong by default
     espEnabled: true,    // ESP overlay on game canvas
   };
+
+  // World map grid - transcribed from the game map image
+  // Each row is [maps...], 0 = empty. Adjacency computed automatically.
+  const MAP_GRID = [
+    /*r0 */ [0,0,137,136,135,134,133,132,131,130,129,128,0,119,110],
+    /*r1 */ [0,0,0,0,61,0,47,0,0,0,0,0,0,0,127],
+    /*r2 */ [0,0,0,153,60,0,243,0,0,0,0,0,0,0,0,126],
+    /*r3 */ [0,0,0,154,66,59,159,160,161,0,0,0,0,0,0,125],
+    /*r4 */ [0,242,155,65,58,158,157,195,196,197,149,148,147,124,138],
+    /*r5 */ [182,183,209,240,67,57,193,194,244,246,0,0,0,0,123],
+    /*r6 */ [0,0,239,237,68,56,191,192,245,247,241,0,0,122,139],
+    /*r7 */ [0,0,238,236,69,55,188,189,190,248,111,112,261,0,121],
+    /*r8 */ [0,201,235,76,70,54,185,186,187,0,249,114,113,260,0,120],
+    /*r9 */ [0,0,234,230,71,53,86,180,253,250,0,0,0,259,0,109],
+    /*r10*/ [0,0,233,229,72,7,85,256,254,251,206,207,258,262,263,108],
+    /*r11*/ [0,0,232,228,73,6,83,84,255,252,205,204,257,0,0,107],
+    /*r12*/ [0,231,0,75,74,5,77,81,82,202,21,203,171,0,0,106],
+    /*r13*/ [10,9,0,8,0,1,11,12,13,15,16,17,103,117,104,62,64],
+    /*r14*/ [0,227,0,38,39,2,14,18,19,98,20,101,102,118,105,0,63],
+    /*r15*/ [282,226,0,46,36,3,25,26,27,97,99,100,0,0,152],
+    /*r16*/ [0,225,0,80,35,4,22,23,24,96],
+    /*r17*/ [0,211,0,78,34,32,29,28,94,95],
+    /*r18*/ [0,212,0,79,87,31,30,91,93,92,224],
+    /*r19*/ [0,213,0,210,88,89,90,156,151,150,223,181],
+    /*r20*/ [214,215,0,216,217,219,0,220,221,222],
+  ];
+
+  // Compute adjacency graph from the grid
+  (function buildMapGraph() {
+    // Build position lookup: mapId -> {row, col}
+    const pos = {};
+    for (let r = 0; r < MAP_GRID.length; r++) {
+      for (let c = 0; c < MAP_GRID[r].length; c++) {
+        const id = MAP_GRID[r][c];
+        if (id > 0) pos[id] = { r, c };
+      }
+    }
+    // Compute neighbors
+    for (const [id, { r, c }] of Object.entries(pos)) {
+      const neighbors = {};
+      // North
+      if (r > 0 && MAP_GRID[r - 1] && MAP_GRID[r - 1][c] > 0) neighbors.n = MAP_GRID[r - 1][c];
+      // South
+      if (r < MAP_GRID.length - 1 && MAP_GRID[r + 1] && MAP_GRID[r + 1][c] > 0) neighbors.s = MAP_GRID[r + 1][c];
+      // West
+      if (c > 0 && MAP_GRID[r][c - 1] > 0) neighbors.w = MAP_GRID[r][c - 1];
+      // East
+      if (c < MAP_GRID[r].length - 1 && MAP_GRID[r][c + 1] > 0) neighbors.e = MAP_GRID[r][c + 1];
+      sniffer.mapGraph[id] = neighbors;
+    }
+  })();
 
   function logPacket(dir, op, name, decoded, size, rawBytes) {
     if (!sniffer.enabled) return;
@@ -302,6 +355,17 @@
           decoded = `[NPC data ${buf.byteLength}b]`;
           break;
         }
+        case 39: { // blockMap
+          const bMap = r.getShort();
+          const bx = r.getByte();
+          const by = r.getByte();
+          const blocked = r.getByte();
+          if (!sniffer.blockedTiles[bMap]) sniffer.blockedTiles[bMap] = new Set();
+          if (blocked) sniffer.blockedTiles[bMap].add(bx + "," + by);
+          else sniffer.blockedTiles[bMap].delete(bx + "," + by);
+          decoded = `map=${bMap} (${bx},${by}) blocked=${blocked}`;
+          break;
+        }
         case 35: { // renderItem
           const itemId = r.getShort();
           const map = r.getShort();
@@ -422,6 +486,10 @@
     spellSlot: 0, spellTargetX: 0, spellTargetY: 0,
     autoTargetEnabled: false, autoTargetId: null,
     comboSlot1: 0, comboSlot2: 0, comboPhase: "first", // "first" | "spam"
+    // Auto-walk
+    autoWalkEnabled: false, autoWalkInterval: null, autoWalkPath: [],
+    autoWalkTargetMap: 0, autoWalkTargetX: 0, autoWalkTargetY: 0, autoWalkMs: 150,
+    autoWalkStuckCount: 0, autoWalkLastPos: null, autoWalkMapRoute: [], // [{map, x, y}]
     packetsSent: 0, packetsRecv: 0,
   };
   let capturingTarget = false;
@@ -566,6 +634,286 @@
   }
 
   // ========================================
+  // 8b. A* Pathfinding + Auto-Walk
+  // ========================================
+
+  function isTileBlocked(x, y) {
+    const map = sniffer.player.map;
+    // Check blocked tiles from server
+    if (sniffer.blockedTiles[map] && sniffer.blockedTiles[map].has(x + "," + y)) return true;
+    // Check entity positions (temporary obstacles)
+    const now = Date.now();
+    for (const [, ent] of Object.entries(sniffer.entities)) {
+      if (ent.x === x && ent.y === y && now - ent.lastSeen < 5000) return true;
+    }
+    return false;
+  }
+
+  function dirToOffset(dir) {
+    if (dir === 1) return { dx: 0, dy: -1 }; // N
+    if (dir === 2) return { dx: 0, dy: 1 };  // S
+    if (dir === 3) return { dx: 1, dy: 0 };  // E
+    if (dir === 4) return { dx: -1, dy: 0 }; // W
+    return { dx: 0, dy: 0 };
+  }
+
+  function offsetToDir(dx, dy) {
+    if (dx === 0 && dy === -1) return 1; // N
+    if (dx === 0 && dy === 1) return 2;  // S
+    if (dx === 1 && dy === 0) return 3;  // E
+    if (dx === -1 && dy === 0) return 4; // W
+    return 0;
+  }
+
+  function findPath(fromX, fromY, toX, toY) {
+    // A* pathfinding - returns array of directions [1,2,3,4,...]
+    if (fromX === toX && fromY === toY) return [];
+
+    // Limit search area
+    const maxDist = Math.abs(toX - fromX) + Math.abs(toY - fromY);
+    const maxNodes = Math.max(5000, maxDist * maxDist);
+
+    const key = (x, y) => x + "," + y;
+    const open = [{ x: fromX, y: fromY, g: 0, f: 0, parent: null, dir: 0 }];
+    const closed = new Set();
+    const gScores = new Map();
+    gScores.set(key(fromX, fromY), 0);
+
+    const neighbors = [
+      { dx: 0, dy: -1, dir: 1 }, // N
+      { dx: 0, dy: 1, dir: 2 },  // S
+      { dx: 1, dy: 0, dir: 3 },  // E
+      { dx: -1, dy: 0, dir: 4 }, // W
+    ];
+
+    let iterations = 0;
+    while (open.length > 0 && iterations < maxNodes) {
+      iterations++;
+      // Find node with lowest f
+      let bestIdx = 0;
+      for (let i = 1; i < open.length; i++) {
+        if (open[i].f < open[bestIdx].f) bestIdx = i;
+      }
+      const current = open.splice(bestIdx, 1)[0];
+      const ck = key(current.x, current.y);
+
+      if (current.x === toX && current.y === toY) {
+        // Reconstruct path
+        const dirs = [];
+        let node = current;
+        while (node.parent) {
+          dirs.unshift(node.dir);
+          node = node.parent;
+        }
+        return dirs;
+      }
+
+      closed.add(ck);
+
+      for (const n of neighbors) {
+        const nx = current.x + n.dx;
+        const ny = current.y + n.dy;
+        const nk = key(nx, ny);
+
+        if (closed.has(nk)) continue;
+        if (nx < 1 || ny < 1 || nx > 200 || ny > 200) continue;
+        // Allow target tile even if "blocked" (might be an NPC we want to reach near)
+        if (!(nx === toX && ny === toY) && isTileBlocked(nx, ny)) continue;
+
+        const g = current.g + 1;
+        if (gScores.has(nk) && g >= gScores.get(nk)) continue;
+
+        gScores.set(nk, g);
+        const h = Math.abs(nx - toX) + Math.abs(ny - toY);
+        open.push({ x: nx, y: ny, g, f: g + h, parent: current, dir: n.dir });
+      }
+    }
+
+    return null; // No path found
+  }
+
+  // BFS to find route between maps using the grid graph
+  // Returns array of {toMap, dir} hops, where dir is the direction to walk to reach toMap
+  function findMapRoute(fromMap, toMap) {
+    if (fromMap === toMap) return [];
+    const queue = [{ map: fromMap, path: [] }];
+    const visited = new Set([fromMap]);
+    while (queue.length > 0) {
+      const { map, path } = queue.shift();
+      const neighbors = sniffer.mapGraph[map];
+      if (!neighbors) continue;
+      for (const [dir, neighborMap] of Object.entries(neighbors)) {
+        if (visited.has(neighborMap)) continue;
+        const hop = { toMap: neighborMap, dir }; // dir: "n","s","e","w"
+        const newPath = [...path, hop];
+        if (neighborMap === toMap) return newPath;
+        visited.add(neighborMap);
+        queue.push({ map: neighborMap, path: newPath });
+      }
+    }
+    return null;
+  }
+
+  function autoWalkTick() {
+    if (!gameWS || gameWS.readyState !== 1) { stopAutoWalk(); return; }
+    const p = sniffer.player;
+    const targetMap = hackState.autoWalkTargetMap || p.map;
+    const tx = hackState.autoWalkTargetX;
+    const ty = hackState.autoWalkTargetY;
+
+    // Determine immediate target: if on different map, walk to the map transition point
+    let immediateX = tx, immediateY = ty;
+
+    if (p.map !== targetMap) {
+      // Need cross-map navigation
+      if (hackState.autoWalkMapRoute.length === 0) {
+        const route = findMapRoute(p.map, targetMap);
+        if (!route) {
+          showToast(`No route from map ${p.map} to map ${targetMap}`);
+          stopAutoWalk();
+          return;
+        }
+        hackState.autoWalkMapRoute = route;
+      }
+
+      // Consume hops we already transitioned through
+      while (hackState.autoWalkMapRoute.length > 0) {
+        const hop = hackState.autoWalkMapRoute[0];
+        // Check if we already passed this hop (we're on or past this map)
+        if (hop.toMap === p.map) {
+          hackState.autoWalkMapRoute.shift();
+          hackState.autoWalkPath = []; // recalculate on new map
+          continue;
+        }
+        break;
+      }
+
+      if (hackState.autoWalkMapRoute.length > 0) {
+        // Use A* to walk to the map edge in the direction of next hop
+        const nextHop = hackState.autoWalkMapRoute[0];
+        // Calculate edge target: walk to the extreme coordinate in that direction
+        // Maps are roughly 100x100 tiles (1-100 range)
+        if (nextHop.dir === "n") immediateX = p.x, immediateY = 1;
+        else if (nextHop.dir === "s") immediateX = p.x, immediateY = 100;
+        else if (nextHop.dir === "e") immediateX = 100, immediateY = p.y;
+        else if (nextHop.dir === "w") immediateX = 1, immediateY = p.y;
+        // Fall through to A* pathfinding below
+      }
+    }
+
+    // Arrived at final destination?
+    if (p.map === targetMap && p.x === tx && p.y === ty) {
+      showToast(`Arrived at map ${targetMap} (${tx}, ${ty})`);
+      stopAutoWalk();
+      return;
+    }
+
+    // At map edge and need to cross? Send one more step in the edge direction
+    if (hackState.autoWalkMapRoute.length > 0) {
+      const nextHop = hackState.autoWalkMapRoute[0];
+      const edgeDir = { n: 1, s: 2, e: 3, w: 4 }[nextHop.dir];
+      const atEdge = (nextHop.dir === "n" && p.y <= 1) ||
+                     (nextHop.dir === "s" && p.y >= 100) ||
+                     (nextHop.dir === "e" && p.x >= 100) ||
+                     (nextHop.dir === "w" && p.x <= 1);
+      if (atEdge) {
+        sendWalk(edgeDir);
+        updateAutoWalkUI();
+        return;
+      }
+    }
+
+    // Detect stuck
+    const curPos = p.map + ":" + p.x + "," + p.y;
+    if (hackState.autoWalkLastPos === curPos) {
+      hackState.autoWalkStuckCount++;
+      if (hackState.autoWalkStuckCount >= 3) {
+        if (hackState.autoWalkPath.length > 0) {
+          const failedDir = hackState.autoWalkPath[0];
+          const off = dirToOffset(failedDir);
+          const bx = p.x + off.dx;
+          const by = p.y + off.dy;
+          if (!sniffer.blockedTiles[p.map]) sniffer.blockedTiles[p.map] = new Set();
+          sniffer.blockedTiles[p.map].add(bx + "," + by);
+        }
+        hackState.autoWalkPath = [];
+        hackState.autoWalkStuckCount = 0;
+      }
+    } else {
+      hackState.autoWalkStuckCount = 0;
+      hackState.autoWalkLastPos = curPos;
+      if (hackState.autoWalkPath.length > 0) hackState.autoWalkPath.shift();
+      // Map changed? recalculate
+      if (p.map !== targetMap) {
+        hackState.autoWalkMapRoute = [];
+      }
+    }
+
+    // Recalculate path if needed
+    if (hackState.autoWalkPath.length === 0) {
+      const path = findPath(p.x, p.y, immediateX, immediateY);
+      if (!path || path.length === 0) {
+        showToast("No path found on this map!");
+        stopAutoWalk();
+        return;
+      }
+      hackState.autoWalkPath = path;
+    }
+
+    const nextDir = hackState.autoWalkPath[0];
+    if (nextDir) sendWalk(nextDir);
+
+    updateAutoWalkUI();
+  }
+
+  function startAutoWalk() {
+    stopAutoWalk();
+    if (!hackState.autoWalkTargetX && !hackState.autoWalkTargetY) return;
+    if (!hackState.autoWalkTargetMap) hackState.autoWalkTargetMap = sniffer.player.map;
+    hackState.autoWalkEnabled = true;
+    hackState.autoWalkPath = [];
+    hackState.autoWalkMapRoute = [];
+    hackState.autoWalkStuckCount = 0;
+    hackState.autoWalkLastPos = null;
+    autoWalkTick();
+    hackState.autoWalkInterval = setInterval(autoWalkTick, hackState.autoWalkMs);
+    updateAutoWalkUI();
+  }
+
+  function stopAutoWalk() {
+    hackState.autoWalkEnabled = false;
+    hackState.autoWalkPath = [];
+    clearInterval(hackState.autoWalkInterval);
+    hackState.autoWalkInterval = null;
+    updateAutoWalkUI();
+  }
+
+  function updateAutoWalkUI() {
+    const btn = document.getElementById("a-walk-btn");
+    if (!btn) return;
+    if (hackState.autoWalkEnabled) {
+      const rem = hackState.autoWalkPath.length;
+      const mapHops = hackState.autoWalkMapRoute.length;
+      const status = mapHops > 0 ? `${rem} steps, ${mapHops} maps left` : `${rem} steps`;
+      btn.textContent = `Walking... (${status})`;
+      btn.classList.add("on");
+    } else {
+      btn.textContent = "Walk To";
+      btn.classList.remove("on");
+    }
+    const routesEl = document.getElementById("a-walk-routes");
+    if (routesEl) {
+      const mapCount = Object.keys(sniffer.mapGraph).length;
+      if (hackState.autoWalkEnabled && hackState.autoWalkMapRoute.length > 0) {
+        const maps = hackState.autoWalkMapRoute.map(h => h.toMap).join(" → ");
+        routesEl.textContent = `Ruta: map ${sniffer.player.map} → ${maps}`;
+      } else {
+        routesEl.textContent = `${mapCount} mapas en el grafo`;
+      }
+    }
+  }
+
+  // ========================================
   // 9. Keyboard Hooks
   // ========================================
   const directionKeys = { w: 1, s: 2, d: 3, a: 4 };
@@ -591,6 +939,12 @@
       togglePanel();
       return;
     }
+    // Shift+G = toggle auto-walk
+    if (e.key === "G" && e.shiftKey) {
+      e.preventDefault(); e.stopPropagation();
+      hackState.autoWalkEnabled ? stopAutoWalk() : startAutoWalk();
+      return;
+    }
     // Shift+R = toggle radar
     if (e.key === "R" && e.shiftKey) {
       e.preventDefault(); e.stopPropagation();
@@ -610,6 +964,7 @@
   // 10. UI Panel
   // ========================================
   let panelEl = null;
+  let activeTab = "spell";
   const PANEL_CSS = `
     #aoweb-audit-panel {
       position:fixed; top:10px; right:10px; z-index:999999;
@@ -637,6 +992,12 @@
     #aoweb-audit-panel .hk { color:#555; font-size:8px; }
     #aoweb-audit-panel .con { color:#0f0; }
     #aoweb-audit-panel .dis { color:#f00; }
+    /* Tabs */
+    #audit-tabs { display:flex; gap:2px; margin:6px 0 4px; flex-wrap:wrap; }
+    #audit-tabs button { flex:1; min-width:0; padding:4px 2px; font-size:9px; text-align:center; border-bottom:2px solid transparent; }
+    #audit-tabs button.tab-active { background:#2a2a00; border-bottom:2px solid #ffd700; color:#ffd700; }
+    .tab-content { display:none; }
+    .tab-content.tab-visible { display:block; }
     /* Sniffer log */
     #audit-sniffer-log {
       background:#0a0a00; border:1px solid #333; border-radius:3px;
@@ -666,6 +1027,16 @@
     }
   `;
 
+  function switchTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll("#aoweb-audit-panel .tab-content").forEach(el => el.classList.remove("tab-visible"));
+    document.querySelectorAll("#audit-tabs button").forEach(btn => btn.classList.remove("tab-active"));
+    const content = document.getElementById("tab-" + tab);
+    const btn = document.getElementById("tabbtn-" + tab);
+    if (content) content.classList.add("tab-visible");
+    if (btn) btn.classList.add("tab-active");
+  }
+
   function createPanel() {
     if (panelEl) return;
     panelEl = document.createElement("div");
@@ -683,68 +1054,108 @@
         | Map:<span id="a-map" class="v">?</span>
       </div>
 
-      <!-- HACKS -->
+      <!-- RADAR (always visible) -->
       <div class="sec">
-        <div class="sec-title">Speed Hack <span class="hk">Shift+H | WASD</span></div>
-        <label>Intervalo: <input type="number" id="a-spd-ms" value="50" min="1" max="1000" step="10">ms</label>
-        <button id="a-spd-btn">Activar</button>
-        <span class="hk">normal=100ms server~150ms</span>
-      </div>
-      <div class="sec">
-        <div class="sec-title">Spell Spam <span class="hk">Shift+X</span></div>
-        <label>Intervalo: <input type="number" id="a-spl-ms" value="200" min="0" max="2000" step="50">ms</label>
-        <label>Slot 1 (inicial): <input type="number" id="a-combo-s1" value="0" min="0" max="20">
-          Slot 2 (spam): <input type="number" id="a-combo-s2" value="0" min="0" max="20"></label>
-        <label>Target X:<input type="number" id="a-tgt-x" value="0" min="0" max="255">
-          Y:<input type="number" id="a-tgt-y" value="0" min="0" max="255"></label>
-        <button id="a-spl-btn">Activar</button>
-        <button id="a-tgt-btn">Capturar Target</button>
-        <button id="a-autotgt-btn" style="background:#440044;border-color:#aa00aa;color:#ff88ff">Auto-Target + Spam</button>
-        <span class="hk">normal=850ms | auto-target sigue al target si se mueve</span>
-      </div>
-      <div class="sec">
-        <div class="sec-title">Melee Spam</div>
-        <label>Intervalo: <input type="number" id="a-mel-ms" value="400" min="0" max="2000" step="50">ms</label>
-        <button id="a-mel-btn">Activar</button>
-        <span class="hk">normal=950ms</span>
-      </div>
-
-      <!-- SNIFFER -->
-      <div class="sec">
-        <div class="sec-title">Packet Sniffer <span class="hk">Shift+E = export</span></div>
-        <button id="a-sniff-toggle">Pausar</button>
-        <button id="a-sniff-clear">Limpiar</button>
-        <button id="a-sniff-copy">Copiar al Clipboard</button>
-        <button id="a-sniff-download">Descargar JSON</button>
-        <label style="display:inline"><input type="checkbox" id="a-sniff-showlog"> Mostrar log</label>
-        <div id="a-sniff-toast" style="display:none;color:#0f0;font-size:9px;margin-top:2px"></div>
-        <div id="audit-sniffer-log" style="display:none">
-          <label style="margin:2px 0"><input type="checkbox" id="a-sniff-ping" checked> Ocultar ping/pong</label>
-          <div id="audit-sniffer-log-entries"></div>
-        </div>
-      </div>
-
-      <!-- RADAR -->
-      <div class="sec">
-        <div class="sec-title">Radar <span class="hk">Shift+R = toggle | click = set target</span></div>
+        <div class="sec-title">Radar <span class="hk">Shift+R | click=target | ctrl+click=walk</span></div>
         <label style="display:inline"><input type="checkbox" id="a-radar-show" checked> Mini-radar</label>
         <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-radar-names" checked> Nombres</label>
-        <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-esp-show" checked> <span style="color:#ff44cc">ESP overlay</span></label>
+        <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-esp-show" checked> <span style="color:#ff44cc">ESP</span></label>
         <div id="audit-radar-wrap">
           <canvas id="audit-radar" width="310" height="310"></canvas>
         </div>
         <div id="audit-entity-list"></div>
       </div>
 
-      <!-- COOLDOWNS -->
-      <div class="sec">
-        <div class="sec-title">Server Cooldowns (medidos)</div>
-        <div id="audit-cooldowns"></div>
+      <!-- TABS -->
+      <div id="audit-tabs">
+        <button id="tabbtn-spell" class="tab-active">Spell</button>
+        <button id="tabbtn-melee">Melee</button>
+        <button id="tabbtn-speed">Speed</button>
+        <button id="tabbtn-walk">Walk</button>
+        <button id="tabbtn-sniffer">Sniffer</button>
+      </div>
+
+      <!-- TAB: SPELL SPAM -->
+      <div id="tab-spell" class="tab-content tab-visible">
+        <div class="sec">
+          <div class="sec-title">Spell Spam <span class="hk">Shift+X</span></div>
+          <label>Intervalo: <input type="number" id="a-spl-ms" value="200" min="0" max="2000" step="50">ms</label>
+          <label>Slot 1 (inicial): <input type="number" id="a-combo-s1" value="0" min="0" max="20">
+            Slot 2 (spam): <input type="number" id="a-combo-s2" value="0" min="0" max="20"></label>
+          <label>Target X:<input type="number" id="a-tgt-x" value="0" min="0" max="255">
+            Y:<input type="number" id="a-tgt-y" value="0" min="0" max="255"></label>
+          <button id="a-spl-btn">Activar</button>
+          <button id="a-tgt-btn">Capturar Target</button>
+          <button id="a-autotgt-btn" style="background:#440044;border-color:#aa00aa;color:#ff88ff">Auto-Target + Spam</button>
+          <span class="hk">normal=850ms | auto-target sigue al target</span>
+        </div>
+      </div>
+
+      <!-- TAB: MELEE SPAM -->
+      <div id="tab-melee" class="tab-content">
+        <div class="sec">
+          <div class="sec-title">Melee Spam</div>
+          <label>Intervalo: <input type="number" id="a-mel-ms" value="400" min="0" max="2000" step="50">ms</label>
+          <button id="a-mel-btn">Activar</button>
+          <span class="hk">normal=950ms</span>
+        </div>
+      </div>
+
+      <!-- TAB: SPEED HACK -->
+      <div id="tab-speed" class="tab-content">
+        <div class="sec">
+          <div class="sec-title">Speed Hack <span class="hk">Shift+H | WASD</span></div>
+          <label>Intervalo: <input type="number" id="a-spd-ms" value="50" min="1" max="1000" step="10">ms</label>
+          <button id="a-spd-btn">Activar</button>
+          <span class="hk">normal=100ms server~150ms</span>
+        </div>
+      </div>
+
+      <!-- TAB: AUTO-WALK -->
+      <div id="tab-walk" class="tab-content">
+        <div class="sec">
+          <div class="sec-title">Auto-Walk <span class="hk">Shift+G | Ctrl+click radar</span></div>
+          <label>Map:<input type="number" id="a-walk-map" value="0" min="0" max="999" style="width:40px">
+            X:<input type="number" id="a-walk-x" value="0" min="0" max="255">
+            Y:<input type="number" id="a-walk-y" value="0" min="0" max="255">
+            <input type="number" id="a-walk-ms" value="150" min="50" max="1000" step="50" style="width:40px">ms</label>
+          <button id="a-walk-btn">Walk To</button>
+          <button id="a-walk-stop">Stop</button>
+          <span class="hk" id="a-walk-status"></span>
+          <div class="hk" id="a-walk-routes"></div>
+        </div>
+      </div>
+
+      <!-- TAB: SNIFFER -->
+      <div id="tab-sniffer" class="tab-content">
+        <div class="sec">
+          <div class="sec-title">Packet Sniffer <span class="hk">Shift+E = export</span></div>
+          <button id="a-sniff-toggle">Pausar</button>
+          <button id="a-sniff-clear">Limpiar</button>
+          <button id="a-sniff-copy">Copiar al Clipboard</button>
+          <button id="a-sniff-download">Descargar JSON</button>
+          <label style="display:inline"><input type="checkbox" id="a-sniff-showlog"> Mostrar log</label>
+          <div id="a-sniff-toast" style="display:none;color:#0f0;font-size:9px;margin-top:2px"></div>
+          <div id="audit-sniffer-log" style="display:none">
+            <label style="margin:2px 0"><input type="checkbox" id="a-sniff-ping" checked> Ocultar ping/pong</label>
+            <div id="audit-sniffer-log-entries"></div>
+          </div>
+        </div>
+        <div class="sec">
+          <div class="sec-title">Server Cooldowns (medidos)</div>
+          <div id="audit-cooldowns"></div>
+        </div>
       </div>
 
       <div class="hk" style="text-align:center;margin-top:4px">Shift+P=panel | Shift+E=export</div>
     `;
     document.body.appendChild(panelEl);
+
+    // Tab click handlers
+    document.querySelectorAll("#audit-tabs button").forEach(btn => {
+      btn.addEventListener("click", () => switchTab(btn.id.replace("tabbtn-", "")));
+    });
+
     setupPanelEvents();
   }
 
@@ -864,6 +1275,7 @@
       }
     });
     // Click on radar to set spell target
+    // Click on radar: normal click = spell target, Ctrl+click = auto-walk destination
     document.getElementById("audit-radar").addEventListener("click", (e) => {
       const canvas = e.target;
       const rect = canvas.getBoundingClientRect();
@@ -872,14 +1284,43 @@
       const scale = canvas.width / RADAR_SIZE;
       const tileX = Math.round(sniffer.player.x + (cx / scale - RADAR_SIZE / 2));
       const tileY = Math.round(sniffer.player.y + (cy / scale - RADAR_SIZE / 2));
-      hackState.spellTargetX = tileX;
-      hackState.spellTargetY = tileY;
-      const xInput = document.getElementById("a-tgt-x");
-      const yInput = document.getElementById("a-tgt-y");
-      if (xInput) xInput.value = tileX;
-      if (yInput) yInput.value = tileY;
-      showToast(`Target seteado: (${tileX}, ${tileY})`);
+
+      if (e.ctrlKey || e.metaKey) {
+        // Ctrl+click = set auto-walk destination
+        hackState.autoWalkTargetX = tileX;
+        hackState.autoWalkTargetY = tileY;
+        document.getElementById("a-walk-x").value = tileX;
+        document.getElementById("a-walk-y").value = tileY;
+        startAutoWalk();
+        showToast(`Walking to (${tileX}, ${tileY})`);
+      } else {
+        hackState.spellTargetX = tileX;
+        hackState.spellTargetY = tileY;
+        const xInput = document.getElementById("a-tgt-x");
+        const yInput = document.getElementById("a-tgt-y");
+        if (xInput) xInput.value = tileX;
+        if (yInput) yInput.value = tileY;
+        showToast(`Spell target: (${tileX}, ${tileY})`);
+      }
     });
+
+    // Auto-walk controls
+    document.getElementById("a-walk-map").addEventListener("change", (e) => {
+      hackState.autoWalkTargetMap = parseInt(e.target.value) || 0;
+    });
+    document.getElementById("a-walk-x").addEventListener("change", (e) => {
+      hackState.autoWalkTargetX = parseInt(e.target.value) || 0;
+    });
+    document.getElementById("a-walk-y").addEventListener("change", (e) => {
+      hackState.autoWalkTargetY = parseInt(e.target.value) || 0;
+    });
+    document.getElementById("a-walk-ms").addEventListener("change", (e) => {
+      hackState.autoWalkMs = parseInt(e.target.value) || 150;
+    });
+    document.getElementById("a-walk-btn").addEventListener("click", () => {
+      hackState.autoWalkEnabled ? stopAutoWalk() : startAutoWalk();
+    });
+    document.getElementById("a-walk-stop").addEventListener("click", stopAutoWalk);
   }
 
   // ========================================
@@ -1044,6 +1485,42 @@
     ctx.font = "bold 9px monospace";
     ctx.textAlign = "center";
     ctx.fillText(`(${p.x},${p.y})`, centerPx, RADAR_PX - 3);
+
+    // Draw auto-walk path
+    if (hackState.autoWalkEnabled && hackState.autoWalkPath.length > 0) {
+      ctx.strokeStyle = "rgba(0, 255, 100, 0.6)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      let wx = p.x, wy = p.y;
+      ctx.moveTo((wx - p.x + half) * TILE_PX + TILE_PX / 2, (wy - p.y + half) * TILE_PX + TILE_PX / 2);
+      for (const dir of hackState.autoWalkPath) {
+        const off = dirToOffset(dir);
+        wx += off.dx;
+        wy += off.dy;
+        const sx = (wx - p.x + half) * TILE_PX + TILE_PX / 2;
+        const sy = (wy - p.y + half) * TILE_PX + TILE_PX / 2;
+        if (sx >= 0 && sx <= RADAR_PX && sy >= 0 && sy <= RADAR_PX) {
+          ctx.lineTo(sx, sy);
+        }
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw destination marker
+      const dtx = (hackState.autoWalkTargetX - p.x + half) * TILE_PX + TILE_PX / 2;
+      const dty = (hackState.autoWalkTargetY - p.y + half) * TILE_PX + TILE_PX / 2;
+      if (dtx >= 0 && dtx <= RADAR_PX && dty >= 0 && dty <= RADAR_PX) {
+        ctx.fillStyle = "#00ff66";
+        ctx.beginPath();
+        ctx.arc(dtx, dty, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#00ff66";
+        ctx.font = "bold 8px monospace";
+        ctx.textAlign = "center";
+        ctx.fillText("DEST", dtx, dty - 7);
+      }
+    }
 
     // Coord axis labels
     ctx.fillStyle = "#446644";
