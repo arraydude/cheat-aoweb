@@ -90,6 +90,8 @@
     maxLog: 500,
     entities: {},        // {id: {name, x, y, heading, lastSeen}}
     player: { map: 0, x: 0, y: 0, heading: 0, hp: 0, maxHp: 0, mana: 0, maxMana: 0, gold: 0, exp: 0, level: 0 },
+    spellDB: {},         // {spellId: {name, manaRequired, ...}} from CDN
+    playerSpells: [],    // [{slot, spellId, name}] learned spells in order
     mapName: "",
     serverCooldowns: {}, // track actual server acceptance times per action type
     blockedTiles: {},    // { mapId: Set<"x,y"> }
@@ -366,6 +368,10 @@
           decoded = `map=${bMap} (${bx},${by}) blocked=${blocked}`;
           break;
         }
+        case 42: { // aprenderSpell
+          decoded = `[spell data ${buf.byteLength}b]`;
+          break;
+        }
         case 35: { // renderItem
           const itemId = r.getShort();
           const map = r.getShort();
@@ -422,6 +428,7 @@
       if (args[0] && args[0].includes("socket.aoweb")) {
         gameWS = ws;
         console.log("[AOWeb Audit] WebSocket captured:", args[0]);
+        sniffer.playerSpells = [];
 
         const origSend = ws.send.bind(ws);
         ws.send = function (data) {
@@ -463,15 +470,13 @@
         hackState.spellTargetX = view[1];
         hackState.spellTargetY = view[2];
         capturingTarget = false;
-        const xInput = document.getElementById("audit-target-x");
-        const yInput = document.getElementById("audit-target-y");
+        const xInput = document.getElementById("a-tgt-x");
+        const yInput = document.getElementById("a-tgt-y");
         if (xInput) xInput.value = hackState.spellTargetX;
         if (yInput) yInput.value = hackState.spellTargetY;
-        const btn = document.getElementById("audit-set-target");
-        if (btn) {
-          btn.textContent = "Target: (" + hackState.spellTargetX + ", " + hackState.spellTargetY + ")";
-          btn.classList.remove("danger");
-        }
+        showToast(`Target: (${hackState.spellTargetX}, ${hackState.spellTargetY}) - casting`);
+        startSpellSpam();
+        updateSpellButtons();
       }
     }
     return origProtoSend.call(this, data);
@@ -493,6 +498,83 @@
     packetsSent: 0, packetsRecv: 0,
   };
   let capturingTarget = false;
+
+  // Persist config to localStorage
+  const CONFIG_KEY = "aoweb-audit-config";
+  const CONFIG_FIELDS = ["speedMs","spellSpamMs","comboSlot1","comboSlot2","autoWalkMs"];
+
+  function saveConfig() {
+    const data = {};
+    for (const f of CONFIG_FIELDS) data[f] = hackState[f];
+    try { localStorage.setItem(CONFIG_KEY, JSON.stringify(data)); } catch (_) {}
+  }
+
+  function loadConfig() {
+    try {
+      const data = JSON.parse(localStorage.getItem(CONFIG_KEY));
+      if (data) {
+        for (const f of CONFIG_FIELDS) { if (data[f] !== undefined) hackState[f] = data[f]; }
+        hackState.spellSlot = hackState.comboSlot2;
+      }
+    } catch (_) {}
+  }
+
+  loadConfig();
+
+  // Fetch spell database from CDN
+  fetch("https://aoweb.nyc3.cdn.digitaloceanspaces.com/init/spells.json")
+    .then(r => r.json())
+    .then(data => {
+      sniffer.spellDB = data;
+      console.log("[AOWeb Audit] Loaded", Object.keys(data).length, "spells from CDN");
+    })
+    .catch(() => {});
+
+  // Fetch character settings to get spell list from macros + known spells
+  fetch("/api/auth/character-settings", { credentials: "include" })
+    .then(r => r.json())
+    .then(data => {
+      if (!data.macros) return;
+      // Build spell list from macros (they have targetSlot + label)
+      const spellMap = new Map(); // slot -> {slot, name, spellId}
+      for (const m of data.macros) {
+        if (m.targetType === "spell" && m.targetSlot !== undefined) {
+          spellMap.set(m.targetSlot, { slot: m.targetSlot, name: m.label, spellId: m.targetId || 0 });
+        }
+      }
+      // Also fill in from spellDB for any spells we know about
+      // We'll also try to get the full spell list from the CDN data later
+      if (spellMap.size > 0) {
+        sniffer.playerSpells = [...spellMap.values()].sort((a, b) => a.slot - b.slot);
+        console.log("[AOWeb Audit] Loaded", sniffer.playerSpells.length, "spells from character-settings");
+        updateSpellDropdowns();
+      }
+    })
+    .catch(() => {});
+
+  // Persist radar config
+  const RADAR_CONFIG_KEY = "aoweb-audit-radar";
+  function saveRadarConfig() {
+    const data = {};
+    for (const id of ["a-radar-show","a-radar-names","a-esp-show","a-radar-entities"]) {
+      const el = document.getElementById(id);
+      if (el) data[id] = el.checked;
+    }
+    try { localStorage.setItem(RADAR_CONFIG_KEY, JSON.stringify(data)); } catch (_) {}
+  }
+  function loadRadarConfig() {
+    try {
+      const data = JSON.parse(localStorage.getItem(RADAR_CONFIG_KEY));
+      if (!data) return;
+      for (const [id, checked] of Object.entries(data)) {
+        const el = document.getElementById(id);
+        if (el) {
+          el.checked = checked;
+          el.dispatchEvent(new Event("change"));
+        }
+      }
+    } catch (_) {}
+  }
 
   // ========================================
   // 8. Hack Functions
@@ -615,22 +697,52 @@
     updateAutoTargetUI();
   }
   function updateAutoTargetUI() {
-    const btn = document.getElementById("a-autotgt-btn");
-    if (!btn) return;
-    if (hackState.autoTargetEnabled && hackState.autoTargetId) {
-      const ent = sniffer.entities[hackState.autoTargetId];
-      const name = ent?.name || hackState.autoTargetId;
-      btn.textContent = `Atacando: ${name}`;
-      btn.classList.add("on");
-    } else {
-      btn.textContent = "Auto-Target + Spam";
-      btn.classList.remove("on");
-    }
     // Sync coord inputs
     const xInput = document.getElementById("a-tgt-x");
     const yInput = document.getElementById("a-tgt-y");
     if (xInput) xInput.value = hackState.spellTargetX;
     if (yInput) yInput.value = hackState.spellTargetY;
+    updateSpellButtons();
+  }
+
+  function updateSpellDropdowns() {
+    const spells = sniffer.playerSpells;
+    if (spells.length === 0) return;
+    for (const selId of ["a-combo-s1", "a-combo-s2"]) {
+      const sel = document.getElementById(selId);
+      if (!sel) continue;
+      const currentVal = parseInt(sel.value) || 0;
+      sel.innerHTML = spells.map(s =>
+        `<option value="${s.slot}"${s.slot === currentVal ? " selected" : ""}>${s.slot}: ${s.name}</option>`
+      ).join("");
+    }
+  }
+
+  function updateSpellButtons() {
+    const offDiv = document.getElementById("a-spell-btns-off");
+    const onDiv = document.getElementById("a-spell-btns-on");
+    const stopBtn = document.getElementById("a-spl-btn");
+    if (!offDiv || !onDiv) return;
+
+    const isActive = hackState.spellSpamEnabled || hackState.autoTargetEnabled || capturingTarget;
+
+    if (isActive) {
+      offDiv.style.display = "none";
+      onDiv.style.display = "block";
+      // Show what's active in the stop button
+      if (capturingTarget) {
+        stopBtn.textContent = "Click en mapa... (Detener)";
+      } else if (hackState.autoTargetEnabled && hackState.autoTargetId) {
+        const ent = sniffer.entities[hackState.autoTargetId];
+        const name = ent?.name || hackState.autoTargetId;
+        stopBtn.textContent = `Atacando: ${name} (Detener)`;
+      } else {
+        stopBtn.textContent = "Detener";
+      }
+    } else {
+      offDiv.style.display = "block";
+      onDiv.style.display = "none";
+    }
   }
 
   // ========================================
@@ -929,9 +1041,33 @@
       if (directionKeys[e.key] !== hackState.speedDirection) startSpeedHack(directionKeys[e.key]);
       return;
     }
-    if (e.key === "X" && e.shiftKey) {
+    // Shift+S = toggle target selection / stop everything
+    if (e.key === "S" && e.shiftKey && !hackState.speedHackEnabled) {
       e.preventDefault(); e.stopPropagation();
-      hackState.spellSpamEnabled ? stopSpellSpam() : startSpellSpam();
+      if (!capturingTarget && !hackState.spellSpamEnabled && !hackState.autoTargetEnabled) {
+        capturingTarget = true;
+        updateSpellButtons();
+        showToast("Click en el mapa para seleccionar target");
+      } else {
+        capturingTarget = false;
+        stopAutoTarget();
+        stopSpellSpam();
+        hackState.spellTargetX = 0;
+        hackState.spellTargetY = 0;
+        const xInput = document.getElementById("a-tgt-x");
+        const yInput = document.getElementById("a-tgt-y");
+        if (xInput) xInput.value = 0;
+        if (yInput) yInput.value = 0;
+        updateSpellButtons();
+        showToast("Spell spam detenido");
+      }
+      return;
+    }
+    // Shift+A = toggle auto-cast
+    if (e.key === "A" && e.shiftKey && !hackState.speedHackEnabled) {
+      e.preventDefault(); e.stopPropagation();
+      if (hackState.autoTargetEnabled) stopAutoTarget();
+      else startAutoTarget();
       return;
     }
     if (e.key === "P" && e.shiftKey) {
@@ -1057,9 +1193,10 @@
       <!-- RADAR (always visible) -->
       <div class="sec">
         <div class="sec-title">Radar <span class="hk">Shift+R | click=target | ctrl+click=walk</span></div>
-        <label style="display:inline"><input type="checkbox" id="a-radar-show" checked> Mini-radar</label>
+        <label style="display:inline"><input type="checkbox" id="a-radar-show" checked> Radar</label>
         <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-radar-names" checked> Nombres</label>
         <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-esp-show" checked> <span style="color:#ff44cc">ESP</span></label>
+        <label style="display:inline;margin-left:6px"><input type="checkbox" id="a-radar-entities" checked> Entidades</label>
         <div id="audit-radar-wrap">
           <canvas id="audit-radar" width="310" height="310"></canvas>
         </div>
@@ -1078,15 +1215,19 @@
       <!-- TAB: SPELL SPAM -->
       <div id="tab-spell" class="tab-content tab-visible">
         <div class="sec">
-          <div class="sec-title">Spell Spam <span class="hk">Shift+X</span></div>
+          <div class="sec-title">Spell Spam <span class="hk">Shift+S=target | Shift+A=cast</span></div>
           <label>Intervalo: <input type="number" id="a-spl-ms" value="200" min="0" max="2000" step="50">ms</label>
-          <label>Slot 1 (inicial): <input type="number" id="a-combo-s1" value="0" min="0" max="20">
-            Slot 2 (spam): <input type="number" id="a-combo-s2" value="0" min="0" max="20"></label>
+          <label>Slot 1 (inicial): <select id="a-combo-s1" style="background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"><option value="0">0: (cargando...)</option></select></label>
+          <label>Slot 2 (spam): <select id="a-combo-s2" style="background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"><option value="0">0: (cargando...)</option></select></label>
           <label>Target X:<input type="number" id="a-tgt-x" value="0" min="0" max="255">
             Y:<input type="number" id="a-tgt-y" value="0" min="0" max="255"></label>
-          <button id="a-spl-btn">Activar</button>
-          <button id="a-tgt-btn">Capturar Target</button>
-          <button id="a-autotgt-btn" style="background:#440044;border-color:#aa00aa;color:#ff88ff">Auto-Target + Spam</button>
+          <div id="a-spell-btns-off">
+            <button id="a-tgt-btn">Capturar Target</button>
+            <button id="a-autotgt-btn" style="background:#440044;border-color:#aa00aa;color:#ff88ff">Auto-Target + Spam</button>
+          </div>
+          <div id="a-spell-btns-on" style="display:none">
+            <button id="a-spl-btn" class="danger">Detener</button>
+          </div>
           <span class="hk">normal=850ms | auto-target sigue al target</span>
         </div>
       </div>
@@ -1156,7 +1297,14 @@
       btn.addEventListener("click", () => switchTab(btn.id.replace("tabbtn-", "")));
     });
 
+    // Restore saved config into inputs
+    document.getElementById("a-spd-ms").value = hackState.speedMs;
+    document.getElementById("a-spl-ms").value = hackState.spellSpamMs;
+    document.getElementById("a-walk-ms").value = hackState.autoWalkMs;
+    // Combo dropdowns are restored after spells load (see restoreDropdowns interval)
+
     setupPanelEvents();
+    loadRadarConfig();
   }
 
   function setupPanelEvents() {
@@ -1178,6 +1326,7 @@
     const spdMs = document.getElementById("a-spd-ms");
     spdMs.addEventListener("change", () => {
       hackState.speedMs = parseInt(spdMs.value) || 50;
+      saveConfig();
       if (hackState.speedHackEnabled) startSpeedHack(hackState.speedDirection);
     });
     document.getElementById("a-spd-btn").addEventListener("click", () => {
@@ -1187,45 +1336,64 @@
     // Spell spam
     document.getElementById("a-spl-ms").addEventListener("change", (e) => {
       hackState.spellSpamMs = parseInt(e.target.value) || 200;
+      saveConfig();
       if (hackState.spellSpamEnabled) startSpellSpam();
     });
     document.getElementById("a-combo-s1").addEventListener("change", (e) => {
       hackState.comboSlot1 = parseInt(e.target.value) || 0;
+      saveConfig();
     });
     document.getElementById("a-combo-s2").addEventListener("change", (e) => {
       hackState.comboSlot2 = parseInt(e.target.value) || 0;
-      hackState.spellSlot = hackState.comboSlot2; // manual spam uses slot2
+      hackState.spellSlot = hackState.comboSlot2;
+      saveConfig();
     });
+    // Retry loading spells from API if not loaded yet
+    const spellRetry = setInterval(() => {
+      if (sniffer.playerSpells.length > 0) { clearInterval(spellRetry); return; }
+      fetch("/api/auth/character-settings", { credentials: "include" })
+        .then(r => r.json())
+        .then(data => {
+          if (!data.macros) return;
+          const spellMap = new Map();
+          for (const m of data.macros) {
+            if (m.targetType === "spell" && m.targetSlot !== undefined) {
+              spellMap.set(m.targetSlot, { slot: m.targetSlot, name: m.label, spellId: m.targetId || 0 });
+            }
+          }
+          if (spellMap.size > 0) {
+            sniffer.playerSpells = [...spellMap.values()].sort((a, b) => a.slot - b.slot);
+            updateSpellDropdowns();
+            clearInterval(spellRetry);
+          }
+        }).catch(() => {});
+    }, 3000);
     document.getElementById("a-tgt-x").addEventListener("change", (e) => {
       hackState.spellTargetX = parseInt(e.target.value) || 0;
     });
     document.getElementById("a-tgt-y").addEventListener("change", (e) => {
       hackState.spellTargetY = parseInt(e.target.value) || 0;
     });
+    // Detener button - stops everything
     document.getElementById("a-spl-btn").addEventListener("click", () => {
-      if (hackState.spellSpamEnabled || hackState.autoTargetEnabled) {
-        stopAutoTarget();
-        stopSpellSpam();
-        hackState.spellTargetX = 0;
-        hackState.spellTargetY = 0;
-        const xInput = document.getElementById("a-tgt-x");
-        const yInput = document.getElementById("a-tgt-y");
-        if (xInput) xInput.value = 0;
-        if (yInput) yInput.value = 0;
-        const tgtBtn = document.getElementById("a-tgt-btn");
-        if (tgtBtn) { tgtBtn.textContent = "Capturar Target"; tgtBtn.classList.remove("danger"); }
-      } else {
-        startSpellSpam();
-      }
+      capturingTarget = false;
+      stopAutoTarget();
+      stopSpellSpam();
+      hackState.spellTargetX = 0;
+      hackState.spellTargetY = 0;
+      const xInput = document.getElementById("a-tgt-x");
+      const yInput = document.getElementById("a-tgt-y");
+      if (xInput) xInput.value = 0;
+      if (yInput) yInput.value = 0;
+      updateSpellButtons();
     });
+    // Capturar Target button
     document.getElementById("a-tgt-btn").addEventListener("click", () => {
       capturingTarget = true;
-      document.getElementById("a-tgt-btn").textContent = "Click en mapa...";
-      document.getElementById("a-tgt-btn").classList.add("danger");
+      updateSpellButtons();
     });
     document.getElementById("a-autotgt-btn").addEventListener("click", () => {
-      if (hackState.autoTargetEnabled) stopAutoTarget();
-      else startAutoTarget();
+      startAutoTarget();
     });
 
     // Melee spam
@@ -1263,16 +1431,24 @@
       document.getElementById("audit-sniffer-log").style.display = e.target.checked ? "block" : "none";
     });
 
-    // Radar controls
+    // Radar controls - all save to localStorage
+    const radarCheckboxes = ["a-radar-show", "a-radar-names", "a-esp-show", "a-radar-entities"];
     document.getElementById("a-radar-show").addEventListener("change", (e) => {
       document.getElementById("audit-radar-wrap").style.display = e.target.checked ? "block" : "none";
+      saveRadarConfig();
     });
+    document.getElementById("a-radar-names").addEventListener("change", () => saveRadarConfig());
     document.getElementById("a-esp-show").addEventListener("change", (e) => {
       sniffer.espEnabled = e.target.checked;
       if (!e.target.checked && overlayCanvas) {
         const ctx = overlayCanvas.getContext("2d");
         ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       }
+      saveRadarConfig();
+    });
+    document.getElementById("a-radar-entities").addEventListener("change", (e) => {
+      document.getElementById("audit-entity-list").style.display = e.target.checked ? "block" : "none";
+      saveRadarConfig();
     });
     // Click on radar to set spell target
     // Click on radar: normal click = spell target, Ctrl+click = auto-walk destination
@@ -1316,6 +1492,7 @@
     });
     document.getElementById("a-walk-ms").addEventListener("change", (e) => {
       hackState.autoWalkMs = parseInt(e.target.value) || 150;
+      saveConfig();
     });
     document.getElementById("a-walk-btn").addEventListener("click", () => {
       hackState.autoWalkEnabled ? stopAutoWalk() : startAutoWalk();
@@ -1685,12 +1862,8 @@
         spdBtn.classList.add("on");
       } else { spdBtn.textContent = "Activar"; spdBtn.classList.remove("on"); }
     }
-    // Spell button
-    const splBtn = document.getElementById("a-spl-btn");
-    if (splBtn) {
-      splBtn.textContent = hackState.spellSpamEnabled ? "Detener" : "Activar";
-      splBtn.classList.toggle("on", hackState.spellSpamEnabled);
-    }
+    // Spell buttons
+    updateSpellButtons();
 
     // Entities
     const entEl = document.getElementById("audit-entity-list");

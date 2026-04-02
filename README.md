@@ -11,12 +11,16 @@ A Chrome extension that demonstrates several client-side vulnerabilities:
 ### Packet Sniffer
 - Full decode of the binary WebSocket protocol (20 client opcodes, 52 server opcodes)
 - Live packet log with timestamps, opcode names, and decoded payloads
-- Export captured data as JSON for analysis
+- Server cooldown tracker (measures actual server-enforced intervals)
+- Export/copy captured data as JSON for analysis
 
 ### Radar + ESP Overlay
 - Mini-radar showing all nearby entities (NPCs and players) with real-time position tracking
-- ESP overlay drawn directly on the game canvas — markers, names, and heading indicators on each entity
+- ESP overlay drawn directly on the game canvas with markers and names
 - **Invisible player detection** — the server sends position, heading, and name of hidden players. The radar and ESP expose them with a pulsing magenta marker
+- Entity list with distance sorting
+- Click on radar to set spell target, Ctrl+click to set auto-walk destination
+- All radar settings persisted to localStorage
 
 ### Speed Hack
 - Sends walk packets at configurable intervals, bypassing the client-side 100ms rate limit
@@ -24,9 +28,19 @@ A Chrome extension that demonstrates several client-side vulnerabilities:
 
 ### Spell Spam + Auto-Target Combo
 - Sends spell cast packets bypassing the client-side 850ms cooldown
-- Auto-target locks the nearest entity and follows it if it moves
-- Combo system: casts spell slot 1 first (e.g. a debuff), then spams slot 2 (e.g. damage spell)
-- Automatically switches to the next nearest target when the current one dies
+- **Spell dropdowns** with names loaded from the game's character-settings API
+- **Combo system**: casts spell slot 1 first (e.g. a debuff), then spams slot 2 (e.g. damage spell)
+- **Auto-target**: locks the nearest entity, follows it if it moves, chains to next target on kill
+- **Capture target**: click on the map to select a target and auto-start casting
+- All spell config persisted to localStorage
+
+### Auto-Walk with A* Pathfinding
+- Set a destination (map, x, y) and the character walks there automatically
+- **A* pathfinding** avoids blocked tiles (opcode 39) and entities
+- **Reactive obstacle avoidance**: detects when stuck and re-paths around obstacles
+- **Cross-map navigation**: hardcoded world map grid (~260 maps) with BFS routing between maps
+- Walk to map edge with pathfinding, then cross to the next map
+- Ctrl+click on radar to set destination and start walking
 
 ### Melee Spam
 - Sends melee attack packets at configurable intervals, bypassing the 950ms client cooldown
@@ -48,10 +62,25 @@ The most critical finding: **invisible players are fully detectable**. The serve
 | Shortcut | Action |
 |----------|--------|
 | Shift+P | Toggle audit panel |
+| Shift+S | Target selection (click map to set target + auto-cast) / Stop all |
+| Shift+A | Toggle auto-target + spell spam |
 | Shift+H | Toggle speed hack (WASD to change direction) |
-| Shift+X | Toggle spell spam |
+| Shift+G | Toggle auto-walk to destination |
 | Shift+R | Toggle radar |
 | Shift+E | Copy sniffer data to clipboard |
+
+## UI
+
+The panel features a **tabbed interface** with the radar always visible at the top:
+
+- **Radar**: always visible — mini-map, ESP overlay toggle, entity list
+- **Spell tab**: combo spell slots (dropdown with spell names), target capture, auto-target
+- **Melee tab**: melee spam with configurable interval
+- **Speed tab**: speed hack with configurable interval
+- **Walk tab**: auto-walk with map/coordinates, A* pathfinding, cross-map routing
+- **Sniffer tab**: packet log, export, server cooldown measurements
+
+All configuration (spell slots, intervals, radar settings) is persisted to localStorage.
 
 ## Protocol Reference
 
