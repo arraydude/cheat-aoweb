@@ -789,13 +789,19 @@
   function updateSpellDropdowns() {
     const spells = sniffer.playerSpells;
     if (spells.length === 0) return;
-    for (const selId of ["a-combo-s1", "a-combo-s2"]) {
-      const sel = document.getElementById(selId);
-      if (!sel) continue;
-      const currentVal = parseInt(sel.value) || 0;
+    for (const base of ["a-combo-s1", "a-combo-s2"]) {
+      const sel = document.getElementById(base);
+      const num = document.getElementById(base + "-num");
+      if (!sel || !num) continue;
+      // Get current value from whichever is visible
+      const currentVal = sel.style.display !== "none" ? (parseInt(sel.value) || 0) : (parseInt(num.value) || 0);
+      // Populate dropdown
       sel.innerHTML = spells.map(s =>
         `<option value="${s.slot}"${s.slot === currentVal ? " selected" : ""}>${s.slot}: ${s.name}</option>`
       ).join("");
+      // Switch from number input to dropdown
+      num.style.display = "none";
+      sel.style.display = "";
     }
   }
 
@@ -1298,8 +1304,14 @@
         <div class="sec">
           <div class="sec-title">Spell Spam <span class="hk">Shift+S=target | Shift+A=cast</span></div>
           <label>Intervalo: <input type="number" id="a-spl-ms" value="200" min="0" max="2000" step="50">ms</label>
-          <label>Slot 1 (inicial): <select id="a-combo-s1" style="background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"><option value="0">0: (cargando...)</option></select></label>
-          <label>Slot 2 (spam): <select id="a-combo-s2" style="background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"><option value="0">0: (cargando...)</option></select></label>
+          <label>Slot 1 (inicial):
+            <input type="number" id="a-combo-s1-num" value="0" min="0" max="20" class="spell-num">
+            <select id="a-combo-s1" style="display:none;background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"></select>
+          </label>
+          <label>Slot 2 (spam):
+            <input type="number" id="a-combo-s2-num" value="0" min="0" max="20" class="spell-num">
+            <select id="a-combo-s2" style="display:none;background:#1a1a00;color:#ffd700;border:1px solid #555;border-radius:3px;font-family:monospace;font-size:10px;max-width:130px"></select>
+          </label>
           <label>Target X:<input type="number" id="a-tgt-x" value="0" min="0" max="255">
             Y:<input type="number" id="a-tgt-y" value="0" min="0" max="255"></label>
           <div id="a-spell-btns-off">
@@ -1382,7 +1394,9 @@
     document.getElementById("a-spd-ms").value = hackState.speedMs;
     document.getElementById("a-spl-ms").value = hackState.spellSpamMs;
     document.getElementById("a-walk-ms").value = hackState.autoWalkMs;
-    // Combo dropdowns are restored after spells load (see restoreDropdowns interval)
+    // Restore saved spell slots into number inputs (visible while spells load)
+    document.getElementById("a-combo-s1-num").value = hackState.comboSlot1;
+    document.getElementById("a-combo-s2-num").value = hackState.comboSlot2;
 
     setupPanelEvents();
     loadRadarConfig();
@@ -1420,15 +1434,18 @@
       saveConfig();
       if (hackState.spellSpamEnabled) startSpellSpam();
     });
-    document.getElementById("a-combo-s1").addEventListener("change", (e) => {
-      hackState.comboSlot1 = parseInt(e.target.value) || 0;
-      saveConfig();
-    });
-    document.getElementById("a-combo-s2").addEventListener("change", (e) => {
-      hackState.comboSlot2 = parseInt(e.target.value) || 0;
-      hackState.spellSlot = hackState.comboSlot2;
-      saveConfig();
-    });
+    // Spell slot change handlers (both number inputs and selects)
+    for (const base of ["a-combo-s1", "a-combo-s2"]) {
+      const isSl2 = base === "a-combo-s2";
+      const handler = (e) => {
+        const val = parseInt(e.target.value) || 0;
+        if (isSl2) { hackState.comboSlot2 = val; hackState.spellSlot = val; }
+        else { hackState.comboSlot1 = val; }
+        saveConfig();
+      };
+      document.getElementById(base).addEventListener("change", handler);
+      document.getElementById(base + "-num").addEventListener("change", handler);
+    }
     // Retry: if opcode 1 didn't parse spells, fall back to macros
     const spellRetry = setInterval(() => {
       if (sniffer.playerSpells.length > 0) { clearInterval(spellRetry); return; }
