@@ -202,6 +202,68 @@
 
     try {
       switch (op) {
+        case 1: { // getMyCharacter - parse position + extract spells
+          try {
+            const myId = r.getDouble();
+            const myName = r.getString();
+            const myHeading = r.getByte();
+            const myMap = r.getShort();
+            const myX = r.getByte();
+            const myY = r.getByte();
+            sniffer.player.map = myMap;
+            sniffer.player.x = myX;
+            sniffer.player.y = myY;
+            sniffer.player.heading = myHeading;
+
+            // Extract spells from the packet
+            // Spell entries are at the end: short(?), byte(slot), short(spellId), getString(name)
+            // Scan for slot=0 + known spellId to find start
+            const spellDB = sniffer.spellDB;
+            if (Object.keys(spellDB).length > 0) {
+              const raw = new Uint8Array(buf);
+              const dv2 = new DataView(buf);
+              for (let i = 22; i < raw.length - 6; i++) {
+                if (raw[i] !== 0) continue; // looking for slot=0
+                const possibleId = dv2.getUint16(i + 1, true);
+                if (!spellDB[possibleId]) continue;
+                // Verify: try reading the name
+                const nameLen = dv2.getUint16(i + 3, true);
+                if (nameLen < 1 || nameLen > 60) continue;
+                // Found slot=0 with valid spell - parse all spells from here
+                let off = i - 2; // back 2 for leading short
+                const spells = [];
+                while (off < raw.length - 5) {
+                  const lead = dv2.getUint16(off, true); off += 2;
+                  const slot = raw[off]; off += 1;
+                  const sid = dv2.getUint16(off, true); off += 2;
+                  const nLen = dv2.getUint16(off, true); off += 2;
+                  if (nLen < 1 || nLen > 60 || off >= raw.length) break;
+                  // Read nLen chars of UTF-8
+                  let bRead = 0, cRead = 0;
+                  while (cRead < nLen && off + bRead < raw.length) {
+                    const b = raw[off + bRead];
+                    bRead += (b < 0x80) ? 1 : (b < 0xE0) ? 2 : (b < 0xF0) ? 3 : 4;
+                    cRead++;
+                  }
+                  const sName = new TextDecoder().decode(raw.slice(off, off + bRead));
+                  off += bRead;
+                  spells.push({ slot, spellId: sid, name: sName });
+                  if (slot > 30) break;
+                }
+                if (spells.length >= 2) {
+                  sniffer.playerSpells = spells;
+                  console.log("[AOWeb Audit] Parsed", spells.length, "spells from getMyCharacter:", spells.map(s => s.slot + ":" + s.name).join(", "));
+                  updateSpellDropdowns();
+                  break;
+                }
+              }
+            }
+            decoded = `"${myName}" map=${myMap} pos=(${myX},${myY}) spells=${sniffer.playerSpells.length} [${buf.byteLength}b]`;
+          } catch (e2) {
+            decoded = `[${buf.byteLength}b] (parse error: ${e2.message})`;
+          }
+          break;
+        }
         case 2: { // getCharacter
           const id = r.getDouble();
           const shortId = String(id).substring(0, 8);
@@ -345,7 +407,25 @@
           trackCooldown("walkAck");
           break;
         }
-        case 22: decoded = `exp=${r.getDouble()}`; break;
+        case 22: {
+          const expVal = r.getDouble();
+          sniffer.player.exp = expVal;
+          decoded = `exp=${expVal}`;
+          break;
+        }
+        case 23: { // actMyLevel - exp, expNextLevel, level, maxHp, maxMana
+          const exp23 = r.getDouble();
+          const expNext = r.getDouble();
+          const level = r.getByte();
+          const maxHp = r.getShort();
+          const maxMana = r.getShort();
+          sniffer.player.exp = exp23;
+          sniffer.player.level = level;
+          sniffer.player.maxHp = maxHp;
+          sniffer.player.maxMana = maxMana;
+          decoded = `lvl=${level} maxHp=${maxHp} maxMana=${maxMana}`;
+          break;
+        }
         case 24: {
           const gold = r.getInt();
           sniffer.player.gold = gold;
