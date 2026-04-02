@@ -610,24 +610,25 @@
     })
     .catch(() => {});
 
-  // Fetch character settings to get spell list from macros + known spells
+  // Fetch character settings macros as fallback spell source
   fetch("/api/auth/character-settings", { credentials: "include" })
     .then(r => r.json())
     .then(data => {
       if (!data.macros) return;
-      // Build spell list from macros (they have targetSlot + label)
-      const spellMap = new Map(); // slot -> {slot, name, spellId}
+      const spellMap = new Map();
       for (const m of data.macros) {
         if (m.targetType === "spell" && m.targetSlot !== undefined) {
           spellMap.set(m.targetSlot, { slot: m.targetSlot, name: m.label, spellId: m.targetId || 0 });
         }
       }
-      // Also fill in from spellDB for any spells we know about
-      // We'll also try to get the full spell list from the CDN data later
       if (spellMap.size > 0) {
-        sniffer.playerSpells = [...spellMap.values()].sort((a, b) => a.slot - b.slot);
-        console.log("[AOWeb Audit] Loaded", sniffer.playerSpells.length, "spells from character-settings");
-        updateSpellDropdowns();
+        sniffer._macroSpells = [...spellMap.values()].sort((a, b) => a.slot - b.slot);
+        // Only use macros if opcode 1 hasn't populated spells yet
+        if (sniffer.playerSpells.length === 0) {
+          sniffer.playerSpells = sniffer._macroSpells;
+          console.log("[AOWeb Audit] Loaded", sniffer.playerSpells.length, "spells from macros (fallback)");
+          updateSpellDropdowns();
+        }
       }
     })
     .catch(() => {});
@@ -1428,25 +1429,15 @@
       hackState.spellSlot = hackState.comboSlot2;
       saveConfig();
     });
-    // Retry loading spells from API if not loaded yet
+    // Retry: if opcode 1 didn't parse spells, fall back to macros
     const spellRetry = setInterval(() => {
       if (sniffer.playerSpells.length > 0) { clearInterval(spellRetry); return; }
-      fetch("/api/auth/character-settings", { credentials: "include" })
-        .then(r => r.json())
-        .then(data => {
-          if (!data.macros) return;
-          const spellMap = new Map();
-          for (const m of data.macros) {
-            if (m.targetType === "spell" && m.targetSlot !== undefined) {
-              spellMap.set(m.targetSlot, { slot: m.targetSlot, name: m.label, spellId: m.targetId || 0 });
-            }
-          }
-          if (spellMap.size > 0) {
-            sniffer.playerSpells = [...spellMap.values()].sort((a, b) => a.slot - b.slot);
-            updateSpellDropdowns();
-            clearInterval(spellRetry);
-          }
-        }).catch(() => {});
+      if (sniffer._macroSpells && sniffer._macroSpells.length > 0) {
+        sniffer.playerSpells = sniffer._macroSpells;
+        console.log("[AOWeb Audit] Using macro spells as fallback:", sniffer.playerSpells.length);
+        updateSpellDropdowns();
+        clearInterval(spellRetry);
+      }
     }, 3000);
     document.getElementById("a-tgt-x").addEventListener("change", (e) => {
       hackState.spellTargetX = parseInt(e.target.value) || 0;
