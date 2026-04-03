@@ -1808,7 +1808,7 @@
   let overlayCanvas = null;
 
   function ensureOverlay() {
-    const gameCanvas = document.querySelector("canvas:not(#audit-esp-overlay)");
+    const gameCanvas = document.querySelector("canvas:not(#audit-esp-overlay):not(#audit-radar)");
     if (!gameCanvas) return null;
 
     // Check if overlay is still correctly attached as sibling of game canvas
